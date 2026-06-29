@@ -8,7 +8,7 @@ This project implements closest-point algorithms for the An* lattices based on t
           
 [VC]      I. Vaughan and L. Clarkson, "An algorithm to compute a nearest point in the lattice An*," in Applied Algebra, 
           Algebraic Algorithms and Error-Correcting Codes (Lecture Notes in Computer Science), vol. 1719, 
-          M. Fossorier, H. Imai, S. Lin, and A. Poli, Eds. Berlin, Germany: Springer-Verlag, 1999, pp. 104–120.
+          Springer, 1999, pp. 104–120.
           
 [MCQ]     R. G. McKilliam, I. V. L. Clarkson, and B. G. Quinn, "An algorithm to compute the nearest point in 
           the lattice An*," IEEE Trans. Inf. Theory, vol. 54, no. 9, pp. 4378–4381, Sep. 2008.
