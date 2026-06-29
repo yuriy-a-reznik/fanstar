@@ -1,5 +1,5 @@
 # fanstar
-Faster closest-point algorithms for the An* lattices.
+Faster algorithms for the An* lattices.
 
 This project implements closest-point algorithms for the An* lattices based on the following papers:
 
@@ -15,9 +15,10 @@ This project implements closest-point algorithms for the An* lattices based on t
           
 [MCSQ]    R. G. McKilliam, I. V. L. Clarkson, W. D. Smith, and B. G. Quinn, "A linear-time nearest
           point algorithm for the lattice An*," in Proc. Int. Symp. Information Theory and its Applications
-          (ISITA), Auckland, New Zealand, Dec. 2008, pp. 1–5.
+          (ISITA), Dec. 2008, pp. 1–5.
           
 [FANSTAR] Y. Reznik, "Faster closest-point algorithms for the An* lattices" -- in preparation, 2026
 
 The [FANSTAR] algorithm is ours, rolling in several improvements over [MCQ] and [MCSQ] methods.  
+
 For reference, the project also implements the closest-point algorithms for the Zn, An, Dn, Dn* and E8 lattices based on the [CS] reference. The test program compares the speed and accuracy of all these methods for n = 2..8.
