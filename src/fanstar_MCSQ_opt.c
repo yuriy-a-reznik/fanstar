@@ -1,0 +1,479 @@
+/*!
+ *  \file       fanstar_MCSQ_opt.c
+ *  \brief      Closest-point search in An lattices -- unrolled and optimized version of McKilliam, Clarkson, Smith, & Quinn algorithm.
+ *
+ *  \author     Yuriy A. Reznik <yreznik@mit.edu>
+ *  \version    1.05
+ *  \date       May 25, 2026
+ *
+ *  \copyright  Copyright (C) 2026 Yuriy A. Reznik
+ *  \license    MIT License: https://opensource.org/licenses/MIT
+ *
+ *  This module contains optimized version of McKilliam, Clarkson, Smith, & Quinn algorithm for An* lattices for n=2..8.
+ *
+ *  Implementation notes:
+ *
+ *  Pre-condition: x lies in the ambient (n+1)-space with x[0] + x[1] + ... + x[n] = 0.
+ * 
+ *  Per-n algorithm implementations:
+ *    everything is unrolled, no loops.
+ *
+ *  Zero-sum simplifications used throughout:
+ *    (a) alpha = sum_j (x_j - k_j) = -sum_j k_j is an EXACT INTEGER. 
+ *        We accumulate the integer round-sum sumk = sum_j k_j  during the rounding pass 
+ *        and set alpha = -(double)sumk. This is cheaper than a floating-point residual 
+ *        sum and free of accumulation error.
+ *    (b) The output projection mean = (sum of final k)/N is obtained as
+ *        (sumk + flips)/N, so no second summation of k is required.
+ *    (c) x is already its own projection (Qy = y), so the input is never projected.
+ *
+ *  Common pipeline (per function):
+ *    1. k_j   = round(x_j);  z_j = x_j - k_j in [-1/2,1/2);  sumk += k_j.
+ *       alpha = -(double)sumk    (exact integer).
+ *    2. Find the optimal nested-candidate prefix that minimises
+ *          h = beta_var - (alpha - cnt)^2 / N
+ *       where beta_var accumulates (1 - 2 z) over the flipped coordinates
+ *       (the constant z'z offset of the papers is dropped).
+ *       MCSQ: bucket residuals, scan buckets 1..N (cnt tracked explicitly, no bucket lists).
+ *    3. Flip the chosen coordinates' k upward by 1; flips counts them.
+ *    4. mean = (double)(sumk + flips)/N;   y_j = (double)k_j - mean.
+ *
+ *   Rounding control:
+ *       For matching C&S implementation exactly, please #define LQ_ROUND_CS 1.
+ *       If LQ_ROUND_CS=0, the rounding is implemented using half-way-up process, which is
+ *       faster. Both methods produce equidistant points from x.
+ */
+
+#include <math.h>
+#include "fanstar.h"
+
+/*!
+ *  Rounding control options:
+ *    LQ_ROUND_CS = 1 -> round to the nearest integer with ties broken toward zero (Conway & Sloan 1982 convention).
+ *    LQ_ROUND_CS = 0 -> round to the nearest integer with ties rounded up (faster execution).
+ */
+#define LQ_ROUND_CS 0
+
+/*! 
+ *  \def   ROUND
+ *  \brief Rounding to the nearest integer macro.
+ */
+#if LQ_ROUND_CS
+#define ROUND(x) ((x) >= 0.0 ? ceil((x)  - 0.5): floor((x) + 0.5))  /* ties broken toward zero */
+#else
+#define ROUND(x) floor((x) + 0.5)                                   /* ties rounded up */
+#endif
+
+/*!
+ *  \def   RND_ACC
+ *  \brief Round x[j] to k[j], store residual z[j], accumulate integer sumk.
+ *         Exploits the zero-sum precondition: alpha = -(double)sumk later.
+ */
+#define RND_ACC(j, x, k, z, sumk)                                     \
+    do {                                                              \
+        k[j] = (long)ROUND(x[j]);                                     \
+        z[j] = x[j] - (double)k[j];                                   \
+        sumk += k[j];                                                 \
+    } while (0)
+
+/*!
+ *  \def MCSQ_BUCKET
+ *  \brief Bucket element j into b[j] = clamp(ceil(N*(1/2 - z_j)), 1, N) and
+ *         scatter (1 - 2 z_j) and a unit count. 
+ * 
+ *  \param[in]  j   Element index (0..N-1).
+ *  \param[in]  N   Bucket dimension. (= ambient dimension = n+1)
+ *  \param[in]  z   Residual array (z[j] = x[j] - k[j]). (z[i] \in [-1/2, 1/2))
+ *  \param[out] b   Bucket array (b[j] = bucket index of element j). 
+ *  \param[out] bd  Bucket data array (bd[i] = sum of (1 - 2 z_j) for elements in bucket i).
+ *  \param[out] bc  Bucket count array (bc[i] = number of elements in bucket i).
+ */
+#define MCSQ_BUCKET(j, N, z, b, bd, bc)                              \
+    do {                                                             \
+        double _t = (double)(N) * (0.5 - z[j]);                      \
+        int _bi = (int)ceil(_t);                                     \
+        if (_bi < 1) _bi = 1; else if (_bi > (N)) _bi = (N);         \
+        b[j] = _bi;                                                  \
+        bd[_bi] += 1.0 - 2.0 * z[j];                                 \
+        bc[_bi] += 1;                                                \
+    } while (0)
+
+/*!
+ *  \def MCSQ_SCAN
+ *  \brief One MCSQ scan step over bucket i. cnt tracks the true number of
+ *         flipped coordinates (a bucket may hold 0, 1 or several elements).
+ *         Captures fbest = cnt at the winning bucket for the projection sum.
+ */
+#define MCSQ_SCAN(i, bd, bc, INV, alpha, acc, cnt, best, m, fbest)   \
+    do {                                                             \
+        double _a, _h;                                               \
+        cnt += bc[i];                                                \
+        acc += bd[i];                                                \
+        _a = (alpha) - (double)cnt;                                  \
+        _h = acc - _a*_a*(INV);                                      \
+        if (_h < (best)) { (best) = _h; (m) = (i); (fbest) = cnt; }  \
+    } while (0)
+
+/*!
+ *  \def MCSQ_RECON
+ *  \brief Reconstruction test: flip k[j] up by 1 iff its bucket <= m.
+ */
+#define MCSQ_RECON(j, b, m, k)                                       \
+    do {                                                             \
+        if (b[j] <= (m)) k[j]++;                                     \
+    } while (0)
+
+
+/****************
+ * 
+ *  Closest-point functions for lattices A_2^* ... A_6^*.
+ * 
+ ****/
+
+/*!
+ *  \brief Closest point of A2* (MCSQ algorithm).
+ * 
+ *   A2*:   N = 3,  single-pass bucketing
+ * 
+ *  \param[in]  x  3-vector, zero-sum.
+ *  \param[out] y  3-vector, closest A2* point (zero-sum).
+ */
+static void closest_point_a2star(const double* x, double* y)
+{
+    long   k[3];  double z[3];  int b[3];
+    double bd[4] = { 0.0 };  int bc[4] = { 0 };
+    double alpha, acc = 0.0, best, mean;
+    long   sumk = 0;  int cnt = 0, m = 0, fbest = 0;
+    const double INV = 1.0 / 3.0;
+
+    /* round, compute residuals, and sum */
+    RND_ACC(0, x, k, z, sumk); RND_ACC(1, x, k, z, sumk); RND_ACC(2, x, k, z, sumk); 
+    alpha = -(double)sumk;
+
+    /* bucket residuals into b[j] = clamp(ceil(N*(1/2 - z_j)), 1, N) and scatter (1 - 2 z_j) and a unit count */
+    MCSQ_BUCKET(0, 3, z, b, bd, bc); MCSQ_BUCKET(1, 3, z, b, bd, bc); MCSQ_BUCKET(2, 3, z, b, bd, bc); 
+
+    /* find prefix that minimises h = beta_var - (alpha - cnt)^2 / N: */
+    best = -(alpha * alpha) * INV;
+    MCSQ_SCAN(1, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(2, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(3, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+
+    /* flip the chosen coordinates' k upward by 1 */
+    MCSQ_RECON(0, b, m, k); MCSQ_RECON(1, b, m, k); MCSQ_RECON(2, b, m, k); 
+
+    /* compute the output lattice point */
+    mean = (double)(sumk + fbest) * INV;
+    y[0] = (double)k[0] - mean; y[1] = (double)k[1] - mean; y[2] = (double)k[2] - mean;
+}
+
+/*!
+ *  \brief Closest point of A3* (MCSQ algorithm).
+ * 
+ *   A3*:   N = 4,  single-pass bucketing
+ *
+ *  \param[in]  x  4-vector, zero-sum.
+ *  \param[out] y  4-vector, closest A3* point (zero-sum).
+ */
+static void closest_point_A3star(const double* x, double* y)
+{
+    long   k[4];  double z[4];  int b[4];
+    double bd[5] = { 0.0 };  int bc[5] = { 0 };
+    double alpha, acc = 0.0, best, mean;
+    long   sumk = 0;  int cnt = 0, m = 0, fbest = 0;
+    const double INV = 1.0 / 4.0;
+
+    /* round, compute residuals, and sum */
+    RND_ACC(0, x, k, z, sumk); RND_ACC(1, x, k, z, sumk);
+    RND_ACC(2, x, k, z, sumk); RND_ACC(3, x, k, z, sumk);
+    alpha = -(double)sumk;
+
+    /* bucket residuals into b[j] = clamp(ceil(N*(1/2 - z_j)), 1, N) and scatter (1 - 2 z_j) and a unit count */
+    MCSQ_BUCKET(0, 4, z, b, bd, bc); MCSQ_BUCKET(1, 4, z, b, bd, bc);
+    MCSQ_BUCKET(2, 4, z, b, bd, bc); MCSQ_BUCKET(3, 4, z, b, bd, bc);
+
+    /* find prefix that minimises h = beta_var - (alpha - cnt)^2 / N: */
+    best = -(alpha * alpha) * INV;
+    MCSQ_SCAN(1, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(2, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(3, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(4, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+
+    /* flip the chosen coordinates' k upward by 1 */
+    MCSQ_RECON(0, b, m, k); MCSQ_RECON(1, b, m, k); 
+    MCSQ_RECON(2, b, m, k); MCSQ_RECON(3, b, m, k); 
+
+    /* compute the output lattice point */
+    mean = (double)(sumk + fbest) * INV;
+    y[0] = (double)k[0] - mean; y[1] = (double)k[1] - mean; 
+    y[2] = (double)k[2] - mean; y[3] = (double)k[3] - mean; 
+}
+
+/*!
+ *  \brief Closest point of A4* (MCSQ algorithm).
+ *
+ *   A4*:   N = 5,  single-pass bucketing
+ *
+ *  \param[in]  x  5-vector, zero-sum.
+ *  \param[out] y  5-vector, closest A4* point (zero-sum).
+ */
+static void closest_point_A4star(const double* x, double* y)
+{
+    long   k[5];  double z[5];  int b[5];
+    double bd[6] = { 0.0 };  int bc[6] = { 0 };
+    double alpha, acc = 0.0, best, mean;
+    long   sumk = 0;  int cnt = 0, m = 0, fbest = 0;
+    const double INV = 1.0 / 5.0;
+
+    /* round, compute residuals, and sum */
+    RND_ACC(0, x, k, z, sumk); RND_ACC(1, x, k, z, sumk);
+    RND_ACC(2, x, k, z, sumk); RND_ACC(3, x, k, z, sumk);
+    RND_ACC(4, x, k, z, sumk); 
+    alpha = -(double)sumk;
+
+    /* bucket residuals into b[j] = clamp(ceil(N*(1/2 - z_j)), 1, N) and scatter (1 - 2 z_j) and a unit count */
+    MCSQ_BUCKET(0, 5, z, b, bd, bc); MCSQ_BUCKET(1, 5, z, b, bd, bc);
+    MCSQ_BUCKET(2, 5, z, b, bd, bc); MCSQ_BUCKET(3, 5, z, b, bd, bc);
+    MCSQ_BUCKET(4, 5, z, b, bd, bc); 
+
+    /* find prefix that minimises h = beta_var - (alpha - cnt)^2 / N: */
+    best = -(alpha * alpha) * INV;
+    MCSQ_SCAN(1, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(2, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(3, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(4, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(5, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+
+    /* flip the chosen coordinates' k upward by 1 */
+    MCSQ_RECON(0, b, m, k); MCSQ_RECON(1, b, m, k); MCSQ_RECON(2, b, m, k);
+    MCSQ_RECON(3, b, m, k); MCSQ_RECON(4, b, m, k); 
+
+    /* compute the output lattice point */
+    mean = (double)(sumk + fbest) * INV;
+    y[0] = (double)k[0] - mean; y[1] = (double)k[1] - mean; y[2] = (double)k[2] - mean;
+    y[3] = (double)k[3] - mean; y[4] = (double)k[4] - mean; 
+}
+
+/*!
+ *  \brief Closest point of A5* (MCSQ algorithm).
+ *
+ *   A5*:   N = 6,  single-pass bucketing
+ *
+ *  \param[in]  x  6-vector, zero-sum.
+ *  \param[out] y  6-vector, closest A5* point (zero-sum).
+ */
+static void closest_point_A5star(const double* x, double* y)
+{
+    long   k[6];  double z[6];  int b[6];
+    double bd[7] = { 0.0 };  int bc[7] = { 0 };
+    double alpha, acc = 0.0, best, mean;
+    long   sumk = 0;  int cnt = 0, m = 0, fbest = 0;
+    const double INV = 1.0 / 6.0;
+
+    /* round, compute residuals, and sum */
+    RND_ACC(0, x, k, z, sumk); RND_ACC(1, x, k, z, sumk);
+    RND_ACC(2, x, k, z, sumk); RND_ACC(3, x, k, z, sumk);
+    RND_ACC(4, x, k, z, sumk); RND_ACC(5, x, k, z, sumk);
+    alpha = -(double)sumk;
+
+    /* bucket residuals into b[j] = clamp(ceil(N*(1/2 - z_j)), 1, N) and scatter (1 - 2 z_j) and a unit count */
+    MCSQ_BUCKET(0, 6, z, b, bd, bc); MCSQ_BUCKET(1, 6, z, b, bd, bc);
+    MCSQ_BUCKET(2, 6, z, b, bd, bc); MCSQ_BUCKET(3, 6, z, b, bd, bc);
+    MCSQ_BUCKET(4, 6, z, b, bd, bc); MCSQ_BUCKET(5, 6, z, b, bd, bc);
+
+    /* find prefix that minimises h = beta_var - (alpha - cnt)^2 / N: */
+    best = -(alpha * alpha) * INV;
+    MCSQ_SCAN(1, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(2, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(3, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(4, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(5, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(6, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+
+    /* flip the chosen coordinates' k upward by 1 */
+    MCSQ_RECON(0, b, m, k); MCSQ_RECON(1, b, m, k); MCSQ_RECON(2, b, m, k);
+    MCSQ_RECON(3, b, m, k); MCSQ_RECON(4, b, m, k); MCSQ_RECON(5, b, m, k);
+
+    /* compute the output lattice point */
+    mean = (double)(sumk + fbest) * INV;
+    y[0] = (double)k[0] - mean; y[1] = (double)k[1] - mean; y[2] = (double)k[2] - mean;
+    y[3] = (double)k[3] - mean; y[4] = (double)k[4] - mean; y[5] = (double)k[5] - mean;
+}
+
+/*!
+ *  \brief Closest point of A6* (MCSQ algorithm).
+ *
+ *   A6*:   N = 7,  single-pass bucketing
+ *
+ *  \param[in]  x  7-vector, zero-sum.
+ *  \param[out] y  7-vector, closest A6* point (zero-sum).
+ */
+static void closest_point_A6star(const double* x, double* y)
+{
+    long   k[7];  double z[7];  int b[7];
+    double bd[8] = { 0.0 };  int bc[8] = { 0 };
+    double alpha, acc = 0.0, best, mean;
+    long   sumk = 0;  int cnt = 0, m = 0, fbest = 0;
+    const double INV = 1.0 / 7.0;
+
+    /* round, compute residuals, and sum */
+    RND_ACC(0, x, k, z, sumk); RND_ACC(1, x, k, z, sumk);
+    RND_ACC(2, x, k, z, sumk); RND_ACC(3, x, k, z, sumk);
+    RND_ACC(4, x, k, z, sumk); RND_ACC(5, x, k, z, sumk);
+    RND_ACC(6, x, k, z, sumk); 
+    alpha = -(double)sumk;
+
+    /* bucket residuals into b[j] = clamp(ceil(N*(1/2 - z_j)), 1, N) and scatter (1 - 2 z_j) and a unit count */
+    MCSQ_BUCKET(0, 7, z, b, bd, bc); MCSQ_BUCKET(1, 7, z, b, bd, bc);
+    MCSQ_BUCKET(2, 7, z, b, bd, bc); MCSQ_BUCKET(3, 7, z, b, bd, bc);
+    MCSQ_BUCKET(4, 7, z, b, bd, bc); MCSQ_BUCKET(5, 7, z, b, bd, bc);
+    MCSQ_BUCKET(6, 7, z, b, bd, bc); 
+
+    /* find prefix that minimises h = beta_var - (alpha - cnt)^2 / N: */
+    best = -(alpha * alpha) * INV;
+    MCSQ_SCAN(1, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(2, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(3, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(4, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(5, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(6, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(7, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+
+    /* flip the chosen coordinates' k upward by 1 */
+    MCSQ_RECON(0, b, m, k); MCSQ_RECON(1, b, m, k); MCSQ_RECON(2, b, m, k);
+    MCSQ_RECON(3, b, m, k); MCSQ_RECON(4, b, m, k); MCSQ_RECON(5, b, m, k);
+    MCSQ_RECON(6, b, m, k); 
+
+    /* compute the output lattice point */
+    mean = (double)(sumk + fbest) * INV;
+    y[0] = (double)k[0] - mean; y[1] = (double)k[1] - mean; y[2] = (double)k[2] - mean;
+    y[3] = (double)k[3] - mean; y[4] = (double)k[4] - mean; y[5] = (double)k[5] - mean;
+    y[6] = (double)k[6] - mean; 
+}
+
+/*!
+ *  \brief Closest point of A7* (MCSQ algorithm).
+ *
+ *   A7*:   N = 8   single-pass bucketing
+ *
+ *  \param[in]  x  8-vector, zero-sum.
+ *  \param[out] y  8-vector, closest A6* point (zero-sum).
+ */
+static void closest_point_A7star(const double* x, double* y)
+{
+    long   k[8];  double z[8];  int b[8];
+    double bd[9] = { 0.0 };  int bc[9] = { 0 };
+    double alpha, acc = 0.0, best, mean;
+    long   sumk = 0;  int cnt = 0, m = 0, fbest = 0;
+    const double INV = 1.0 / 8.0;
+
+	/* round, compute residuals, and sum */
+    RND_ACC(0, x, k, z, sumk); RND_ACC(1, x, k, z, sumk);
+    RND_ACC(2, x, k, z, sumk); RND_ACC(3, x, k, z, sumk);
+    RND_ACC(4, x, k, z, sumk); RND_ACC(5, x, k, z, sumk);
+    RND_ACC(6, x, k, z, sumk); RND_ACC(7, x, k, z, sumk);
+    alpha = -(double)sumk;
+
+	/* bucket residuals into b[j] = clamp(ceil(N*(1/2 - z_j)), 1, N) and scatter (1 - 2 z_j) and a unit count */
+    MCSQ_BUCKET(0, 8, z, b, bd, bc); MCSQ_BUCKET(1, 8, z, b, bd, bc);
+    MCSQ_BUCKET(2, 8, z, b, bd, bc); MCSQ_BUCKET(3, 8, z, b, bd, bc);
+    MCSQ_BUCKET(4, 8, z, b, bd, bc); MCSQ_BUCKET(5, 8, z, b, bd, bc);
+    MCSQ_BUCKET(6, 8, z, b, bd, bc); MCSQ_BUCKET(7, 8, z, b, bd, bc);
+
+	/* find prefix that minimises h = beta_var - (alpha - cnt)^2 / N: */
+    best = -(alpha * alpha) * INV;
+    MCSQ_SCAN(1, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(2, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(3, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(4, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(5, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(6, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(7, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(8, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+
+	/* flip the chosen coordinates' k upward by 1 */
+    MCSQ_RECON(0, b, m, k); MCSQ_RECON(1, b, m, k); MCSQ_RECON(2, b, m, k);
+    MCSQ_RECON(3, b, m, k); MCSQ_RECON(4, b, m, k); MCSQ_RECON(5, b, m, k);
+    MCSQ_RECON(6, b, m, k); MCSQ_RECON(7, b, m, k);
+
+    /* compute the output lattice point */
+    mean = (double)(sumk + fbest) * INV;
+    y[0] = (double)k[0] - mean; y[1] = (double)k[1] - mean; y[2] = (double)k[2] - mean;
+    y[3] = (double)k[3] - mean; y[4] = (double)k[4] - mean; y[5] = (double)k[5] - mean;
+    y[6] = (double)k[6] - mean; y[7] = (double)k[7] - mean;
+}
+
+/*!
+ *  \brief Closest point of A8* (MCSQ algorithm).
+ *
+ *   A8*:   N = 9   single-pass bucketing 
+ *
+ *  \param[in]  x  9-vector, zero-sum.
+ *  \param[out] y  9-vector, closest A8* point (zero-sum).
+ */
+static void closest_point_A8star(const double* x, double* y)
+{
+    long   k[9];  double z[9];  int b[9];
+    double bd[10] = { 0.0 };  int bc[10] = { 0 };
+    double alpha, acc = 0.0, best, mean;
+    long   sumk = 0;  int cnt = 0, m = 0, fbest = 0;
+    const double INV = 1.0 / 9.0;
+
+    RND_ACC(0, x, k, z, sumk); RND_ACC(1, x, k, z, sumk);
+    RND_ACC(2, x, k, z, sumk); RND_ACC(3, x, k, z, sumk);
+    RND_ACC(4, x, k, z, sumk); RND_ACC(5, x, k, z, sumk);
+    RND_ACC(6, x, k, z, sumk); RND_ACC(7, x, k, z, sumk);
+    RND_ACC(8, x, k, z, sumk);
+    alpha = -(double)sumk;
+
+    MCSQ_BUCKET(0, 9, z, b, bd, bc); MCSQ_BUCKET(1, 9, z, b, bd, bc);
+    MCSQ_BUCKET(2, 9, z, b, bd, bc); MCSQ_BUCKET(3, 9, z, b, bd, bc);
+    MCSQ_BUCKET(4, 9, z, b, bd, bc); MCSQ_BUCKET(5, 9, z, b, bd, bc);
+    MCSQ_BUCKET(6, 9, z, b, bd, bc); MCSQ_BUCKET(7, 9, z, b, bd, bc);
+    MCSQ_BUCKET(8, 9, z, b, bd, bc);
+
+    best = -(alpha * alpha) * INV;
+    MCSQ_SCAN(1, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(2, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(3, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(4, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(5, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(6, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(7, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(8, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+    MCSQ_SCAN(9, bd, bc, INV, alpha, acc, cnt, best, m, fbest);
+
+    MCSQ_RECON(0, b, m, k); MCSQ_RECON(1, b, m, k); MCSQ_RECON(2, b, m, k);
+    MCSQ_RECON(3, b, m, k); MCSQ_RECON(4, b, m, k); MCSQ_RECON(5, b, m, k);
+    MCSQ_RECON(6, b, m, k); MCSQ_RECON(7, b, m, k); MCSQ_RECON(8, b, m, k);
+
+    mean = (double)(sumk + fbest) * INV;
+    y[0] = (double)k[0] - mean; y[1] = (double)k[1] - mean; y[2] = (double)k[2] - mean;
+    y[3] = (double)k[3] - mean; y[4] = (double)k[4] - mean; y[5] = (double)k[5] - mean;
+    y[6] = (double)k[6] - mean; y[7] = (double)k[7] - mean; y[8] = (double)k[8] - mean;
+}
+
+/* Unified closest-point function type */
+typedef void (*closest_point_Anstar_t)(const double* x, double* y);
+
+/* Dispatch table: */
+static const closest_point_Anstar_t closest_point_Anstar[] = {
+    NULL, NULL, closest_point_a2star, closest_point_A3star, closest_point_A4star,
+    closest_point_A5star, closest_point_A6star, closest_point_A7star, closest_point_A8star
+};
+
+/*!
+ *  \brief Closest point of An* (faster method for n=2..8).
+ */
+int closest_point_Anstar_MCSQ_opt(const double* x, double* y, int n)
+{
+    /* check parameters: */
+	if (n < 2 || n > 8) return LQ_INVARG;
+
+    /* call the appropriate size-optimized function: */
+	closest_point_Anstar[n](x, y);
+
+    return LQ_SUCCESS;
+}
+
+/* fanstar.c -- end of file */

@@ -1,0 +1,9 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="fanstar.vcxproj" Id="f34887be-7d55-4641-8f79-73edbd3b6d42">
+    <BuildType Solution="Debug|x64" Project="Release" />
+  </Project>
+</Solution>
